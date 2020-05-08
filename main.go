@@ -21,16 +21,17 @@ import (
 )
 
 type Config struct {
-	TokenExpiresIn int
-	SigningKey     *string
-	Audience       *string
-	ServerName     *string
-	BindAddress    *string
-	BindPort       *string
-	TlsKeyFile     *string
-	TlsCertFile    *string
-	DisableMlock   *bool
-	PAMServiceName *string
+	TokenExpiresIn     int
+	PostTokenExpiresIn int
+	SigningKey         *string
+	Audience           *string
+	ServerName         *string
+	BindAddress        *string
+	BindPort           *string
+	TlsKeyFile         *string
+	TlsCertFile        *string
+	DisableMlock       *bool
+	PAMServiceName     *string
 }
 
 type User struct {
@@ -71,6 +72,11 @@ func newConfig() *Config {
 		tokenExpiry = 10 //default token expiry
 	}
 	c.TokenExpiresIn = tokenExpiry
+	postTokenExpiry, err := strconv.Atoi(os.Getenv("PAMHOOK_POST_TOKEN_EXPIRES_IN"))
+	if err != nil {
+		postTokenExpiry = 10 //default token expiry
+	}
+	c.PostTokenExpiresIn = postTokenExpiry
 	signingKey := os.Getenv("PAMHOOK_SIGNING_KEY")
 	c.SigningKey = &signingKey
 	audience := os.Getenv("PAMHOOK_AUDIENCE")
@@ -240,42 +246,64 @@ func authenticateHandler(c *Config) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func tokenHandler(c *Config) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		username, password, ok := r.BasicAuth()
-		tokenExpiresIn := c.TokenExpiresIn
+func getUserAuth(r *http.Request) (string, string, bool) {
+	if r.Method == http.MethodGet {
+		return r.BasicAuth()
+	}
+	if r.Method == http.MethodPost {
+		return r.PostFormValue("username"), r.PostFormValue("password"), true
+	}
+	return "", "", false
+}
+
+func getTokenExpiry(c *Config, r *http.Request) (int, error) {
+	if r.Method == http.MethodGet {
 		if v := r.URL.Query().Get("token-expires-in"); v != "" {
 			if t, err := strconv.Atoi(v); err != nil {
-				glog.Errorf("Got a non int token expiry: %s", v)
-				http.Error(w, fmt.Sprintf("'%s' is not a valid integer", v),
-					http.StatusBadRequest)
-				return
+				return 0, fmt.Errorf("'%s' is not a valid integer", v)
 			} else {
-				if t > tokenExpiresIn {
-					glog.V(2).Infof("Ignoring token expiry %d, which is greater than"+
-						"configured token expiry: ", tokenExpiresIn)
-					http.Error(w, fmt.Sprintf("%d is greater than the configured"+
-						" token-expiry", t), http.StatusBadRequest)
-					return
-				} else {
-					tokenExpiresIn = t
-					glog.V(3).Infof("Overriding configured token with: %d", tokenExpiresIn)
-				}
+				return t, nil
 			}
 		}
+	}
+	if r.Method == http.MethodPost {
+		return c.PostTokenExpiresIn, nil
+	}
+	return c.TokenExpiresIn, nil
+}
+
+func tokenHandler(c *Config) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
+		username, password, ok := getUserAuth(r)
 		if !ok {
 			status = http.StatusNotFound
 			glog.V(2).Infof("%s %s: %s, %d", r.Method, r.URL.Path, r.UserAgent(), status)
-			http.Error(w, "Supply username and password", http.StatusNotFound)
+			http.Error(w, "Supply username and password", status)
 			return
+		}
+		tokenExpiresIn, err := getTokenExpiry(c, r)
+		if err != nil {
+			glog.Error(err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		} else {
+			if tokenExpiresIn > c.TokenExpiresIn {
+				glog.V(2).Infof("Ignoring token expiry %d, which is greater than"+
+					"configured token expiry: ", tokenExpiresIn)
+				http.Error(w, fmt.Sprintf("%d is greater than the configured"+
+					" token-expiry", tokenExpiresIn), http.StatusBadRequest)
+				return
+			} else {
+				glog.V(3).Infof("Overriding configured token with: %d", tokenExpiresIn)
+			}
 		}
 		if err := authenticateUser(c.PAMServiceName, username, password); err != nil {
 			status = http.StatusForbidden
 			glog.V(2).Infof("%s %s: %s, %s, %d", r.Method, r.URL.Path, r.UserAgent(),
 				r.URL.Query(), status)
 			glog.Errorf("Authenticating user failed with: %s", err)
-			http.Error(w, err.Error(), http.StatusForbidden)
+			http.Error(w, err.Error(), status)
 			return
 		}
 		b, err := createToken(username, c, tokenExpiresIn)
@@ -284,7 +312,7 @@ func tokenHandler(c *Config) func(w http.ResponseWriter, r *http.Request) {
 			glog.V(2).Infof("%s %s: %s, %v, %d", r.Method, r.URL.Path, r.UserAgent(),
 				r.URL.Query(), status)
 			glog.Errorf("%s", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), status)
 			return
 		}
 		glog.V(2).Infof("%s %s: %s, %v, %d", r.Method, r.URL.Path, r.UserAgent(),
@@ -298,6 +326,7 @@ func main() {
 	u, _ := user.Current()
 	config := newConfig()
 	flag.IntVar(&config.TokenExpiresIn, "token-expires-in", config.TokenExpiresIn, "Specifies how long the token is valid for in minutes, configurable via PAMHOOK_TOKEN_EXPIRES_IN environment variable")
+	flag.IntVar(&config.PostTokenExpiresIn, "post-token-expires-in", config.TokenExpiresIn, "Specifies how long the token is valid for in minutes for POST requests, configurable via PAMHOOK_POST_TOKEN_EXPIRES_IN environment variable")
 	flag.StringVar(config.SigningKey, "signing-key", *config.SigningKey, "Key for signing the token (required), configurable via PAMHOOK_SIGNING_KEY environment variable")
 	flag.StringVar(config.Audience, "audience", *config.Audience, "Server that consumes the pam_hook endpoint, configurable via PAMHOOK_AUDIENCE environment variable")
 	flag.StringVar(config.ServerName, "server-name", *config.ServerName, "The domain name for pam-hook, configurable via PAMHOOK_SERVERNAME environment variable")
